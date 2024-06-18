@@ -6,11 +6,12 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { CreateOrderDto } from './dto/create-order.dto';
-import { PrismaClient } from '@prisma/client';
+import { OrderStatus, PrismaClient } from '@prisma/client';
 import { ClientProxy, RpcException } from '@nestjs/microservices';
-import { ChangeStatusOrderDto, OrderPaginationDto } from './dto';
+import { ChangeStatusOrderDto, OrderPaginationDto, PaidOrderDto } from './dto';
 import { NATS_SERVICE } from 'src/config';
 import { firstValueFrom } from 'rxjs';
+import { OrderWithProducts } from './interface/order-with-products';
 
 @Injectable()
 export class OrdersService extends PrismaClient implements OnModuleInit {
@@ -21,22 +22,18 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
     this.logger.log('Database Connected');
   }
 
-  constructor(
-    @Inject(NATS_SERVICE) private readonly productsClient: ClientProxy,
-  ) {
+  constructor(@Inject(NATS_SERVICE) private readonly client: ClientProxy) {
     super();
   }
 
   async validateProductsMs(payload, data) {
     try {
-      const products = await firstValueFrom(
-        this.productsClient.send(payload, data),
-      );
+      const products = await firstValueFrom(this.client.send(payload, data));
       return products;
     } catch (error) {
       throw new RpcException({
         status: HttpStatus.BAD_REQUEST,
-        message: 'Error in servce Product ms',
+        message: 'Error in service Product ms',
       });
     }
   }
@@ -49,7 +46,6 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
         { cmd: 'validate_products' },
         productsIds,
       );
-
       const totalAmount = createOrderDto.items.reduce((acc, orderItem) => {
         const price = products.find(
           (product) => product.id === orderItem.productId,
@@ -181,5 +177,61 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
         status: status,
       },
     });
+  }
+
+  async createPaymentSession(order: OrderWithProducts) {
+    try {
+      const paymentSession = await firstValueFrom(
+        this.client.send('create.payment.session', {
+          orderId: order.id,
+          currency: 'usd',
+          items: order.OrderItem.map((item) => ({
+            name: item.name,
+            price: item.price,
+            quantity: item.quantity,
+          })),
+        }),
+      );
+
+      return paymentSession;
+    } catch (error) {
+      console.log(error);
+      throw new RpcException({
+        status: HttpStatus.BAD_REQUEST,
+        message: error,
+      });
+    }
+  }
+
+  async paidOrder(paidOrderDto: PaidOrderDto) {
+    this.logger.log(paidOrderDto);
+    try {
+      const order = await this.order.update({
+        where: {
+          id: paidOrderDto.orderId,
+        },
+        data: {
+          status: OrderStatus.PAID,
+          paid: true,
+          paidAt: new Date(),
+          stipeChargeId: paidOrderDto.stripePaymentId,
+
+          // Relation OrderReceipt
+          OrderReceipt: {
+            create: {
+              receiptUrl: paidOrderDto.receiptUrl,
+            },
+          },
+        },
+      });
+
+      return order;
+    } catch (error) {
+      console.log(error);
+      throw new RpcException({
+        status: HttpStatus.BAD_REQUEST,
+        message: error,
+      });
+    }
   }
 }
